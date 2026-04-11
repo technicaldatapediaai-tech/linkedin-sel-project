@@ -1,0 +1,4 @@
+{
+  "attach_to_existing_browser": false,
+  "debugger_address": "127.0.0.1:9222"
+}
