@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_FILE = BASE_DIR / "profiles.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 PROFILE_DIR = BASE_DIR / "chrome-profile"
+DEBUG_DIR = BASE_DIR / "debug_output"
 WAIT_SECONDS = 15
 
 
@@ -80,6 +81,17 @@ def build_driver(settings: Settings) -> webdriver.Chrome:
     return webdriver.Chrome(options=options)
 
 
+def save_debug_artifacts(driver: webdriver.Chrome, prefix: str) -> None:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    safe_prefix = prefix.replace(" ", "_").replace("/", "_").replace("\\", "_")
+    html_path = DEBUG_DIR / f"{safe_prefix}.html"
+    screenshot_path = DEBUG_DIR / f"{safe_prefix}.png"
+    html_path.write_text(driver.page_source, encoding="utf-8")
+    driver.save_screenshot(str(screenshot_path))
+    print(f"  Saved debug HTML: {html_path}")
+    print(f"  Saved debug screenshot: {screenshot_path}")
+
+
 def debugger_is_reachable(debugger_address: str) -> bool:
     host, port_text = debugger_address.split(":", maxsplit=1)
     try:
@@ -119,6 +131,36 @@ def click_element(driver: webdriver.Chrome, element: WebElement) -> None:
     driver.execute_script("arguments[0].click();", element)
 
 
+def top_card_root(driver: webdriver.Chrome) -> Optional[WebElement]:
+    selectors = [
+        (By.XPATH, "//main//*[contains(@class, 'pv-top-card')]"),
+        (By.XPATH, "//main//section[.//*[contains(text(), 'Contact info')]]"),
+        (By.XPATH, "//main//section[.//a[contains(@href, '/overlay/contact-info/')]]"),
+    ]
+    for by, selector in selectors:
+        elements = driver.find_elements(by, selector)
+        for element in elements:
+            if element.is_displayed():
+                return element
+    return None
+
+
+def top_card_has_text(driver: webdriver.Chrome, text: str) -> bool:
+    root = top_card_root(driver)
+    if not root:
+        return False
+    content = " ".join(
+        filter(
+            None,
+            [
+                root.text,
+                root.get_attribute("innerText"),
+            ],
+        )
+    ).lower()
+    return text.lower() in content
+
+
 def fill_textarea(driver: webdriver.Chrome, selectors: list[tuple[str, str]], text: str) -> bool:
     field = wait_for_any(driver, selectors)
     if not field:
@@ -148,6 +190,9 @@ def click_inside_dialog_by_labels(driver: webdriver.Chrome, labels: list[str]) -
         (By.XPATH, "//*[@role='dialog']//button"),
         (By.XPATH, "//*[@role='dialog']//a"),
         (By.XPATH, "//*[@role='dialog']//*[@role='button']"),
+        (By.XPATH, "//*[@data-test-modal]//button"),
+        (By.XPATH, "//*[@data-test-modal]//a"),
+        (By.XPATH, "//*[@data-test-modal]//*[@role='button']"),
     ]
     end_time = time.time() + WAIT_SECONDS
     while time.time() < end_time:
@@ -160,104 +205,126 @@ def click_inside_dialog_by_labels(driver: webdriver.Chrome, labels: list[str]) -
 
 
 def click_dialog_button_by_aria_label(driver: webdriver.Chrome, labels: list[str]) -> bool:
-    wait = WebDriverWait(driver, WAIT_SECONDS)
-    for label in labels:
-        xpath = (
-            "//*[@role='dialog']"
-            f"//button[@aria-label='{label}' or .//span[normalize-space()='{label}']]"
-        )
-        try:
-            element = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            click_element(driver, element)
-            return True
-        except TimeoutException:
-            continue
+    end_time = time.time() + WAIT_SECONDS
+    while time.time() < end_time:
+        for label in labels:
+            selectors = [
+                (By.XPATH, f"//button[@aria-label='{label}']"),
+                (By.XPATH, f"//button[.//span[normalize-space()='{label}']]"),
+                (By.XPATH, f"//*[@role='dialog']//button[@aria-label='{label}']"),
+                (By.XPATH, f"//*[@data-test-modal]//button[@aria-label='{label}']"),
+            ]
+            for by, selector in selectors:
+                for element in driver.find_elements(by, selector):
+                    if element.is_enabled():
+                        click_element(driver, element)
+                        return True
+        time.sleep(0.5)
     return False
 
 
 def wait_for_dialog(driver: webdriver.Chrome) -> bool:
-    end_time = time.time() + WAIT_SECONDS
-    while time.time() < end_time:
-        dialogs = driver.find_elements(By.XPATH, "//*[@role='dialog']")
-        for dialog in dialogs:
-            if dialog.is_displayed():
-                return True
-        time.sleep(0.5)
+    wait = WebDriverWait(driver, WAIT_SECONDS)
+    selectors = [
+        (By.XPATH, "//button[@aria-label='Add a note']"),
+        (By.XPATH, "//button[@aria-label='Send without a note']"),
+        (By.XPATH, "//button[@aria-label='Send invitation']"),
+        (By.XPATH, "//*[@id='custom-message']"),
+        (By.XPATH, "//*[@role='dialog']"),
+        (By.XPATH, "//*[@data-test-modal]"),
+    ]
+    for by, selector in selectors:
+        try:
+            wait.until(EC.presence_of_element_located((by, selector)))
+            return True
+        except TimeoutException:
+            continue
     return False
 
 
 def log_dialog_actions(driver: webdriver.Chrome) -> None:
-    dialogs = driver.find_elements(By.XPATH, "//*[@role='dialog']")
-    for dialog in dialogs:
-        if not dialog.is_displayed():
+    actions = driver.find_elements(
+        By.XPATH,
+        "(//*[@role='dialog'] | //*[@data-test-modal])//button | "
+        "(//*[@role='dialog'] | //*[@data-test-modal])//a | "
+        "(//*[@role='dialog'] | //*[@data-test-modal])//*[@role='button']",
+    )
+    labels: list[str] = []
+    for action in actions:
+        text = " ".join(
+            filter(
+                None,
+                [
+                    action.text.strip(),
+                    action.get_attribute("aria-label"),
+                ],
+            )
+        ).strip()
+        if text:
+            labels.append(text)
+    if labels:
+        print(f"  Dialog actions seen: {labels}")
+
+
+def log_visible_buttons(driver: webdriver.Chrome) -> None:
+    buttons = driver.find_elements(By.XPATH, "//button | //a")
+    labels: list[str] = []
+    for button in buttons:
+        if not button.is_displayed():
             continue
-        actions = dialog.find_elements(By.XPATH, ".//button|.//a|.//*[@role='button']")
-        labels: list[str] = []
-        for action in actions:
-            text = " ".join(
-                filter(
-                    None,
-                    [
-                        action.text.strip(),
-                        action.get_attribute("aria-label"),
-                    ],
-                )
-            ).strip()
-            if text:
-                labels.append(text)
-        if labels:
-            print(f"  Dialog actions seen: {labels}")
-        return
+        text = " ".join(
+            filter(
+                None,
+                [
+                    button.text.strip(),
+                    button.get_attribute("aria-label"),
+                    button.get_attribute("href"),
+                ],
+            )
+        ).strip()
+        if text:
+            labels.append(text)
+    if labels:
+        print(f"  Visible actions on page: {labels[:40]}")
 
 
 def click_connect_action(driver: webdriver.Chrome) -> bool:
+    root = top_card_root(driver)
+    if not root:
+        return False
+
     selectors = [
-        (
-            By.XPATH,
-            "//main//a[contains(@aria-label, ' to connect') or .//span[normalize-space()='Connect']]",
-        ),
-        (
-            By.XPATH,
-            "//main//button[contains(@aria-label, 'Connect') or .//span[normalize-space()='Connect']]",
-        ),
-        (
-            By.XPATH,
-            "//div[contains(@class, 'pv-top-card')]//a[contains(@aria-label, ' to connect') or .//span[normalize-space()='Connect']]",
-        ),
-        (
-            By.XPATH,
-            "//div[contains(@class, 'pv-top-card')]//button[contains(@aria-label, 'Connect') or .//span[normalize-space()='Connect']]",
-        ),
+        (By.XPATH, ".//a[contains(@aria-label, ' to connect')]"),
+        (By.XPATH, ".//a[.//span[normalize-space()='Connect']]"),
+        (By.XPATH, ".//button[contains(@aria-label, 'Connect')]"),
+        (By.XPATH, ".//button[.//span[normalize-space()='Connect']]"),
     ]
-    end_time = time.time() + WAIT_SECONDS
-    while time.time() < end_time:
-        for by, selector in selectors:
-            elements = driver.find_elements(by, selector)
-            for element in elements:
-                if element.is_displayed() and element.is_enabled():
-                    click_element(driver, element)
-                    return True
-        time.sleep(0.5)
+    for by, selector in selectors:
+        for element in root.find_elements(by, selector):
+            if element.is_displayed() and element.is_enabled():
+                click_element(driver, element)
+                return True
     return False
 
 
 def fill_dialog_textarea(driver: webdriver.Chrome, text: str) -> bool:
-    wait = WebDriverWait(driver, WAIT_SECONDS)
+    end_time = time.time() + WAIT_SECONDS
     selectors = [
-        (By.XPATH, "//*[@role='dialog']//*[@id='custom-message']"),
         (By.ID, "custom-message"),
-        (By.XPATH, "//*[@role='dialog']//textarea"),
+        (By.XPATH, "//*[@id='custom-message']"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//textarea"),
+        (By.XPATH, "//textarea[@name='message']"),
     ]
-    for by, selector in selectors:
-        try:
-            field = wait.until(EC.visibility_of_element_located((by, selector)))
-            click_element(driver, field)
-            field.send_keys(Keys.CONTROL, "a")
-            field.send_keys(Keys.DELETE)
-            field.send_keys(text)
-            return True
-        except TimeoutException:
-            continue
+    while time.time() < end_time:
+        for by, selector in selectors:
+            for field in driver.find_elements(by, selector):
+                if field.is_enabled():
+                    click_element(driver, field)
+                    field.send_keys(Keys.CONTROL, "a")
+                    field.send_keys(Keys.DELETE)
+                    field.send_keys(text)
+                    return True
+        time.sleep(0.5)
     return False
 
 
@@ -367,33 +434,45 @@ def open_more_menu_if_needed(driver: webdriver.Chrome, desired_labels: list[str]
 
 def send_connection_request(driver: webdriver.Chrome, task: ProfileTask) -> bool:
     print("  Looking for Connect action")
+    if top_card_has_text(driver, "pending"):
+        print("  Invitation is already pending for this profile")
+        return True
+
     if not open_more_menu_if_needed(driver, ["Connect"]):
         return False
 
     if not click_connect_action(driver) and not click_menu_action(driver, ["Connect"]):
         print("  Could not find a visible Connect action")
+        save_debug_artifacts(driver, "connect_not_found")
         return False
 
     if not wait_for_dialog(driver):
         print("  Connect click did not open a dialog")
+        save_debug_artifacts(driver, "connect_dialog_not_found")
         return False
 
     time.sleep(1)
     log_dialog_actions(driver)
     if task.note:
         print("  Connect dialog opened, trying Add a note")
+        log_dialog_actions(driver)
+        log_visible_buttons(driver)
         if not click_dialog_button_by_aria_label(driver, ["Add a note"]):
             log_dialog_actions(driver)
+            log_visible_buttons(driver)
             print("  Could not find Add a note in the connect dialog")
+            save_debug_artifacts(driver, "add_note_not_found")
             return False
         filled = fill_dialog_textarea(driver, task.note)
         if not filled:
             print("  Could not fill the connection note field")
+            save_debug_artifacts(driver, "note_textarea_not_found")
             return False
 
     sent = click_dialog_button_by_aria_label(driver, ["Send invitation", "Send without a note"])
     if not sent:
         print("  Could not find the final Send button in the connect dialog")
+        save_debug_artifacts(driver, "send_invitation_not_found")
     return sent
 
 
@@ -416,6 +495,7 @@ def send_message(driver: webdriver.Chrome, task: ProfileTask) -> bool:
     )
     if not filled:
         print("  Could not find the message composer textbox")
+        save_debug_artifacts(driver, "message_textbox_not_found")
         return False
 
     sent = (
@@ -425,6 +505,7 @@ def send_message(driver: webdriver.Chrome, task: ProfileTask) -> bool:
     )
     if not sent:
         print("  Could not find the Send button in the message dialog")
+        save_debug_artifacts(driver, "message_send_not_found")
     return sent
 
 
@@ -454,7 +535,8 @@ def main() -> None:
                 success = run_task(driver, task)
             except Exception as exc:  # noqa: BLE001
                 success = False
-                print(f"  Failed: {exc}")
+                print(f"  Failed: {type(exc).__name__}: {exc}")
+                save_debug_artifacts(driver, "unexpected_error")
             results.append((task.url, task.action, success))
             time.sleep(2)
     finally:
