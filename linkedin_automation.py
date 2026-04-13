@@ -22,6 +22,100 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 PROFILE_DIR = BASE_DIR / "chrome-profile"
 DEBUG_DIR = BASE_DIR / "debug_output"
 WAIT_SECONDS = 15
+DEEP_QUERY_SCRIPT = """
+const selectors = arguments[0] || [];
+const labels = (arguments[1] || []).map((value) => String(value).toLowerCase());
+const requireLabel = labels.length > 0;
+const matches = [];
+const visitedRoots = new Set();
+
+function elementText(element) {
+  return [
+    element.innerText,
+    element.textContent,
+    element.getAttribute('aria-label'),
+    element.getAttribute('placeholder'),
+    element.getAttribute('value'),
+    element.value,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function isUsable(element) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+  const style = element.ownerDocument.defaultView.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') {
+    return false;
+  }
+  if (element.getAttribute('aria-hidden') === 'true') {
+    return false;
+  }
+  if ('disabled' in element && element.disabled) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 || rect.height > 0;
+}
+
+function searchRoot(root) {
+  if (!root || visitedRoots.has(root)) {
+    return;
+  }
+  visitedRoots.add(root);
+
+  for (const selector of selectors) {
+    let elements = [];
+    try {
+      elements = Array.from(root.querySelectorAll(selector));
+    } catch (error) {
+      continue;
+    }
+    for (const element of elements) {
+      if (!isUsable(element)) {
+        continue;
+      }
+      if (requireLabel) {
+        const content = elementText(element);
+        if (!labels.some((label) => content.includes(label))) {
+          continue;
+        }
+      }
+      if (!matches.includes(element)) {
+        matches.push(element);
+      }
+    }
+  }
+
+  let descendants = [];
+  try {
+    descendants = Array.from(root.querySelectorAll('*'));
+  } catch (error) {
+    descendants = [];
+  }
+  for (const element of descendants) {
+    if (element.shadowRoot) {
+      searchRoot(element.shadowRoot);
+    }
+    if (element.tagName === 'IFRAME') {
+      try {
+        if (element.contentDocument) {
+          searchRoot(element.contentDocument);
+        }
+      } catch (error) {
+      }
+    }
+  }
+}
+
+searchRoot(document);
+return matches;
+"""
 
 
 @dataclass
@@ -125,6 +219,525 @@ def wait_for_any(driver: webdriver.Chrome, selectors: list[tuple[str, str]]) -> 
     return None
 
 
+def deep_find_elements(
+    driver: webdriver.Chrome,
+    selectors: list[str],
+    labels: Optional[list[str]] = None,
+) -> list[WebElement]:
+    return driver.execute_script(DEEP_QUERY_SCRIPT, selectors, labels or [])
+
+
+def deep_wait_for_any(
+    driver: webdriver.Chrome,
+    selectors: list[str],
+    labels: Optional[list[str]] = None,
+) -> Optional[WebElement]:
+    end_time = time.time() + WAIT_SECONDS
+    while time.time() < end_time:
+        elements = deep_find_elements(driver, selectors, labels)
+        for element in elements:
+            if element.is_enabled():
+                return element
+        time.sleep(0.5)
+    return None
+
+
+def cdp_flattened_nodes(driver: webdriver.Chrome) -> list[dict]:
+    try:
+        document = driver.execute_cdp_cmd("DOM.getFlattenedDocument", {"depth": -1, "pierce": True})
+        return document.get("nodes", [])
+    except Exception:
+        return []
+
+
+def cdp_node_attributes(node: dict) -> dict[str, str]:
+    raw_attributes = node.get("attributes", [])
+    attributes: dict[str, str] = {}
+    for index in range(0, len(raw_attributes), 2):
+        if index + 1 < len(raw_attributes):
+            attributes[str(raw_attributes[index])] = str(raw_attributes[index + 1])
+    return attributes
+
+
+def cdp_find_nodes_by_attribute(
+    driver: webdriver.Chrome,
+    tag_names: list[str],
+    attribute_name: str,
+    values: list[str],
+) -> list[int]:
+    normalized_tags = {tag.upper() for tag in tag_names}
+    normalized_values = {value.lower() for value in values}
+    node_ids: list[int] = []
+    for node in cdp_flattened_nodes(driver):
+        if node.get("nodeName") not in normalized_tags:
+            continue
+        attributes = cdp_node_attributes(node)
+        attribute_value = attributes.get(attribute_name)
+        if attribute_value and attribute_value.lower() in normalized_values:
+            node_id = node.get("nodeId")
+            if isinstance(node_id, int):
+                node_ids.append(node_id)
+    return node_ids
+
+
+def cdp_click_node(driver: webdriver.Chrome, node_id: int) -> bool:
+    try:
+        resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"nodeId": node_id})
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            return False
+        visibility = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && this.getAttribute('aria-hidden') !== 'true'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        if not visibility.get("result", {}).get("value"):
+            return False
+        driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        this.scrollIntoView({block: 'center'});
+                        this.click();
+                        return true;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
+def cdp_set_node_value(driver: webdriver.Chrome, node_id: int, value: str) -> bool:
+    try:
+        resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"nodeId": node_id})
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            return False
+        visibility = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && this.getAttribute('aria-hidden') !== 'true'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        if not visibility.get("result", {}).get("value"):
+            return False
+        result = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function(value) {
+                        this.focus();
+                        const isTextInput = this.tagName === 'TEXTAREA' || this.tagName === 'INPUT';
+                        if (isTextInput) {
+                            const prototype = this.tagName === 'TEXTAREA'
+                                ? HTMLTextAreaElement.prototype
+                                : HTMLInputElement.prototype;
+                            const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+                            if (!descriptor || !descriptor.set) {
+                                return false;
+                            }
+                            descriptor.set.call(this, value);
+                            this.dispatchEvent(new Event('input', { bubbles: true }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        if (this.isContentEditable || this.getAttribute('contenteditable') === 'true' || this.getAttribute('role') === 'textbox') {
+                            this.textContent = value;
+                            this.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        return false;
+                    }
+                """,
+                "arguments": [{"value": value}],
+                "returnByValue": True,
+            },
+        )
+        return bool(result.get("result", {}).get("value"))
+    except Exception:
+        return False
+
+
+def ax_tree(driver: webdriver.Chrome) -> list[dict]:
+    try:
+        driver.execute_cdp_cmd("Accessibility.enable", {})
+    except Exception:
+        pass
+    try:
+        return driver.execute_cdp_cmd("Accessibility.getFullAXTree", {}).get("nodes", [])
+    except Exception:
+        return []
+
+
+def ax_find_backend_node_ids(
+    driver: webdriver.Chrome,
+    role_names: list[str],
+    accessible_names: list[str],
+) -> list[int]:
+    normalized_roles = {role.lower() for role in role_names}
+    normalized_names = {name.lower() for name in accessible_names}
+    backend_ids: list[int] = []
+    for node in ax_tree(driver):
+        if node.get("ignored"):
+            continue
+        role = str(node.get("role", {}).get("value", "")).lower()
+        name = str(node.get("name", {}).get("value", "")).strip().lower()
+        if role not in normalized_roles or name not in normalized_names:
+            continue
+        backend_id = node.get("backendDOMNodeId")
+        if isinstance(backend_id, int):
+            backend_ids.append(backend_id)
+    return backend_ids
+
+
+def cdp_click_backend_node(driver: webdriver.Chrome, backend_node_id: int) -> bool:
+    try:
+        resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_node_id})
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            return False
+        visibility = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && this.getAttribute('aria-hidden') !== 'true'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        if not visibility.get("result", {}).get("value"):
+            return False
+        driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        this.scrollIntoView({block: 'center'});
+                        this.click();
+                        return true;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
+def cdp_set_backend_node_text(driver: webdriver.Chrome, backend_node_id: int, value: str) -> bool:
+    try:
+        resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_node_id})
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            return False
+        visibility = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && this.getAttribute('aria-hidden') !== 'true'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        if not visibility.get("result", {}).get("value"):
+            return False
+        result = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function(value) {
+                        this.focus();
+                        const isTextInput = this.tagName === 'TEXTAREA' || this.tagName === 'INPUT';
+                        if (isTextInput) {
+                            const prototype = this.tagName === 'TEXTAREA'
+                                ? HTMLTextAreaElement.prototype
+                                : HTMLInputElement.prototype;
+                            const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+                            if (!descriptor || !descriptor.set) {
+                                return false;
+                            }
+                            descriptor.set.call(this, value);
+                            this.dispatchEvent(new Event('input', { bubbles: true }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        if (this.isContentEditable || this.getAttribute('contenteditable') === 'true' || this.getAttribute('role') === 'textbox') {
+                            this.textContent = value;
+                            this.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                        return false;
+                    }
+                """,
+                "arguments": [{"value": value}],
+                "returnByValue": True,
+            },
+        )
+        return bool(result.get("result", {}).get("value"))
+    except Exception:
+        return False
+
+
+def cdp_find_editable_node_ids(driver: webdriver.Chrome, hints: Optional[list[str]] = None) -> list[int]:
+    normalized_hints = [hint.lower() for hint in (hints or [])]
+    node_ids: list[int] = []
+    for node in cdp_flattened_nodes(driver):
+        node_name = str(node.get("nodeName", "")).upper()
+        attributes = cdp_node_attributes(node)
+        role = attributes.get("role", "").lower()
+        contenteditable = attributes.get("contenteditable", "").lower()
+        text_blob = " ".join(
+            filter(
+                None,
+                [
+                    attributes.get("aria-label"),
+                    attributes.get("aria-placeholder"),
+                    attributes.get("placeholder"),
+                    attributes.get("name"),
+                    attributes.get("id"),
+                    attributes.get("maxlength"),
+                ],
+            )
+        ).lower()
+        is_editable = (
+            node_name in {"TEXTAREA", "INPUT"}
+            or role == "textbox"
+            or contenteditable == "true"
+            or attributes.get("aria-multiline", "").lower() == "true"
+        )
+        if not is_editable:
+            continue
+        if normalized_hints and not any(hint in text_blob for hint in normalized_hints):
+            continue
+        node_id = node.get("nodeId")
+        if isinstance(node_id, int):
+            node_ids.append(node_id)
+    return node_ids
+
+
+def ax_node_text(node: dict) -> str:
+    chunks: list[str] = []
+    for key in ("name", "description", "value"):
+        raw = node.get(key, {})
+        if isinstance(raw, dict):
+            value = raw.get("value")
+            if value:
+                chunks.append(str(value))
+    for prop in node.get("properties", []):
+        if not isinstance(prop, dict):
+            continue
+        prop_name = str(prop.get("name", ""))
+        prop_value = prop.get("value", {})
+        if isinstance(prop_value, dict) and prop_value.get("value") not in (None, ""):
+            chunks.append(f"{prop_name} {prop_value.get('value')}")
+    return " ".join(chunks).strip().lower()
+
+
+def ax_find_editable_backend_node_ids(
+    driver: webdriver.Chrome,
+    hints: Optional[list[str]] = None,
+) -> list[int]:
+    normalized_hints = [hint.lower() for hint in (hints or [])]
+    backend_ids: list[int] = []
+    for node in ax_tree(driver):
+        if node.get("ignored"):
+            continue
+        role = str(node.get("role", {}).get("value", "")).lower()
+        if not any(token in role for token in ["textbox", "text field", "textarea"]):
+            continue
+        text_blob = ax_node_text(node)
+        if normalized_hints and not any(hint in text_blob for hint in normalized_hints):
+            continue
+        backend_id = node.get("backendDOMNodeId")
+        if isinstance(backend_id, int):
+            backend_ids.append(backend_id)
+    return backend_ids
+
+
+def element_accepts_text(element: WebElement) -> bool:
+    try:
+        tag_name = element.tag_name.lower()
+    except Exception:
+        tag_name = ""
+    try:
+        role = (element.get_attribute("role") or "").lower()
+    except Exception:
+        role = ""
+    try:
+        contenteditable = (element.get_attribute("contenteditable") or "").lower()
+    except Exception:
+        contenteditable = ""
+    return tag_name in {"textarea", "input"} or role == "textbox" or contenteditable == "true"
+
+
+def fill_editable_element(driver: webdriver.Chrome, element: WebElement, text: str) -> bool:
+    if not element_accepts_text(element):
+        return False
+    try:
+        click_element(driver, element)
+    except Exception:
+        pass
+    try:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.DELETE)
+        element.send_keys(text)
+        return True
+    except Exception:
+        pass
+    try:
+        return bool(
+            driver.execute_script(
+                """
+                const element = arguments[0];
+                const value = arguments[1];
+                element.focus();
+                if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
+                    const prototype = element.tagName === 'TEXTAREA'
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+                    if (!descriptor || !descriptor.set) {
+                        return false;
+                    }
+                    descriptor.set.call(element, value);
+                    element.dispatchEvent(new Event('input', { bubbles: true }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+                if (element.isContentEditable || element.getAttribute('contenteditable') === 'true' || element.getAttribute('role') === 'textbox') {
+                    element.textContent = value;
+                    element.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+                return false;
+                """,
+                element,
+                text,
+            )
+        )
+    except Exception:
+        return False
+
+
+def type_into_active_element(driver: webdriver.Chrome, text: str) -> bool:
+    try:
+        element = driver.switch_to.active_element
+    except Exception:
+        return False
+    if not element:
+        return False
+    return fill_editable_element(driver, element, text)
+
+
+def cdp_click_viewport_point(driver: webdriver.Chrome, x: int, y: int) -> bool:
+    try:
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+        )
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def try_fill_dialog_textarea_by_focus(driver: webdriver.Chrome, text: str) -> bool:
+    for _ in range(6):
+        if type_into_active_element(driver, text):
+            return True
+        try:
+            driver.switch_to.active_element.send_keys(Keys.TAB)
+        except Exception:
+            try:
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.TAB)
+            except Exception:
+                return False
+        time.sleep(0.3)
+    return False
+
+
+def try_fill_dialog_textarea_by_center_click(driver: webdriver.Chrome, text: str) -> bool:
+    try:
+        size = driver.get_window_size()
+    except Exception:
+        return False
+    width = int(size.get("width", 0))
+    height = int(size.get("height", 0))
+    if width <= 0 or height <= 0:
+        return False
+    points = [
+        (0.50, 0.24),
+        (0.50, 0.28),
+        (0.50, 0.32),
+    ]
+    for x_ratio, y_ratio in points:
+        if not cdp_click_viewport_point(driver, int(width * x_ratio), int(height * y_ratio)):
+            continue
+        time.sleep(0.3)
+        if try_fill_dialog_textarea_by_focus(driver, text):
+            return True
+    return False
+
+
 def click_element(driver: webdriver.Chrome, element: WebElement) -> None:
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
     time.sleep(0.8)
@@ -165,11 +778,7 @@ def fill_textarea(driver: webdriver.Chrome, selectors: list[tuple[str, str]], te
     field = wait_for_any(driver, selectors)
     if not field:
         return False
-    click_element(driver, field)
-    field.send_keys(Keys.CONTROL, "a")
-    field.send_keys(Keys.DELETE)
-    field.send_keys(text)
-    return True
+    return fill_editable_element(driver, field, text)
 
 
 def click_button_by_text(driver: webdriver.Chrome, texts: list[str]) -> bool:
@@ -200,6 +809,10 @@ def click_inside_dialog_by_labels(driver: webdriver.Chrome, labels: list[str]) -
         if element:
             click_element(driver, element)
             return True
+        for element in deep_find_elements(driver, ["button", "a", "[role='button']"], labels):
+            if element.is_enabled():
+                click_element(driver, element)
+                return True
         time.sleep(0.5)
     return False
 
@@ -219,12 +832,21 @@ def click_dialog_button_by_aria_label(driver: webdriver.Chrome, labels: list[str
                     if element.is_enabled():
                         click_element(driver, element)
                         return True
+        for element in deep_find_elements(driver, ["button", "a", "[role='button']"], labels):
+            if element.is_enabled():
+                click_element(driver, element)
+                return True
+        for node_id in cdp_find_nodes_by_attribute(driver, ["button"], "aria-label", labels):
+            if cdp_click_node(driver, node_id):
+                return True
+        for backend_node_id in ax_find_backend_node_ids(driver, ["button"], labels):
+            if cdp_click_backend_node(driver, backend_node_id):
+                return True
         time.sleep(0.5)
     return False
 
 
 def wait_for_dialog(driver: webdriver.Chrome) -> bool:
-    wait = WebDriverWait(driver, WAIT_SECONDS)
     selectors = [
         (By.XPATH, "//button[@aria-label='Add a note']"),
         (By.XPATH, "//button[@aria-label='Send without a note']"),
@@ -233,11 +855,108 @@ def wait_for_dialog(driver: webdriver.Chrome) -> bool:
         (By.XPATH, "//*[@role='dialog']"),
         (By.XPATH, "//*[@data-test-modal]"),
     ]
-    for by, selector in selectors:
-        try:
-            wait.until(EC.presence_of_element_located((by, selector)))
+    if wait_for_any(driver, selectors):
+        return True
+    if deep_wait_for_any(
+        driver,
+        ["button", "a", "[role='button']", "textarea", "dialog", "[role='dialog']", "[data-test-modal]"],
+        ["Add a note", "Send without a note", "Send invitation"],
+    ):
+        return True
+    if deep_wait_for_any(driver, ["#custom-message", "textarea"]):
+        return True
+    if cdp_find_nodes_by_attribute(
+        driver,
+        ["button"],
+        "aria-label",
+        ["Add a note", "Send without a note", "Send invitation"],
+    ):
+        return True
+    if ax_find_backend_node_ids(driver, ["button"], ["Add a note", "Send without a note", "Send invitation"]):
+        return True
+    if cdp_find_nodes_by_attribute(driver, ["textarea"], "id", ["custom-message"]):
+        return True
+    return False
+
+
+def wait_for_note_editor(driver: webdriver.Chrome) -> bool:
+    selectors = [
+        (By.XPATH, "//*[@id='custom-message']"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//textarea"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//*[@role='textbox']"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//*[@contenteditable='true']"),
+        (By.XPATH, "//*[contains(@placeholder, 'We know each other')]"),
+        (By.XPATH, "//button[@aria-label='Send invitation']"),
+        (By.XPATH, "//button[normalize-space()='Send']"),
+        (By.XPATH, "//*[contains(normalize-space(), '0/200')]"),
+    ]
+    if wait_for_any(driver, selectors):
+        return True
+    if deep_wait_for_any(
+        driver,
+        [
+            "#custom-message",
+            "textarea",
+            "[role='textbox']",
+            "[contenteditable='true']",
+            "[placeholder*='We know each other']",
+            "button",
+        ],
+        ["We know each other", "Send", "0/200"],
+    ):
+        return True
+    for node_id in cdp_find_editable_node_ids(driver, ["we know each other", "message", "200"]):
+        resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"nodeId": node_id})
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            continue
+        visibility = driver.execute_cdp_cmd(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": """
+                    function() {
+                        const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                        const rect = this.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && this.getAttribute('aria-hidden') !== 'true'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    }
+                """,
+                "returnByValue": True,
+            },
+        )
+        if visibility.get("result", {}).get("value"):
             return True
-        except TimeoutException:
+    for backend_node_id in ax_find_editable_backend_node_ids(driver, ["we know each other", "message", "note", "200"]):
+        try:
+            resolved = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_node_id})
+            object_id = resolved.get("object", {}).get("objectId")
+            if not object_id:
+                continue
+            visibility = driver.execute_cdp_cmd(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": """
+                        function() {
+                            const style = this.ownerDocument.defaultView.getComputedStyle(this);
+                            const rect = this.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && this.getAttribute('aria-hidden') !== 'true'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        }
+                    """,
+                    "returnByValue": True,
+                },
+            )
+            if visibility.get("result", {}).get("value"):
+                return True
+        except Exception:
             continue
     return False
 
@@ -262,6 +981,19 @@ def log_dialog_actions(driver: webdriver.Chrome) -> None:
         ).strip()
         if text:
             labels.append(text)
+    for action in deep_find_elements(driver, ["button", "a", "[role='button']"]):
+        text = " ".join(
+            filter(
+                None,
+                [
+                    action.text.strip(),
+                    action.get_attribute("aria-label"),
+                    action.get_attribute("innerText"),
+                ],
+            )
+        ).strip()
+        if text and text not in labels:
+            labels.append(text)
     if labels:
         print(f"  Dialog actions seen: {labels}")
 
@@ -283,6 +1015,20 @@ def log_visible_buttons(driver: webdriver.Chrome) -> None:
             )
         ).strip()
         if text:
+            labels.append(text)
+    for button in deep_find_elements(driver, ["button", "a", "[role='button']"]):
+        text = " ".join(
+            filter(
+                None,
+                [
+                    button.text.strip(),
+                    button.get_attribute("aria-label"),
+                    button.get_attribute("href"),
+                    button.get_attribute("innerText"),
+                ],
+            )
+        ).strip()
+        if text and text not in labels:
             labels.append(text)
     if labels:
         print(f"  Visible actions on page: {labels[:40]}")
@@ -314,16 +1060,56 @@ def fill_dialog_textarea(driver: webdriver.Chrome, text: str) -> bool:
         (By.XPATH, "//*[@id='custom-message']"),
         (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//textarea"),
         (By.XPATH, "//textarea[@name='message']"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//*[@role='textbox']"),
+        (By.XPATH, "(//*[@role='dialog'] | //*[@data-test-modal])//*[@contenteditable='true']"),
+        (By.XPATH, "//*[contains(@placeholder, 'We know each other')]"),
     ]
     while time.time() < end_time:
         for by, selector in selectors:
             for field in driver.find_elements(by, selector):
-                if field.is_enabled():
-                    click_element(driver, field)
-                    field.send_keys(Keys.CONTROL, "a")
-                    field.send_keys(Keys.DELETE)
-                    field.send_keys(text)
+                if field.is_enabled() and fill_editable_element(driver, field, text):
                     return True
+        for field in deep_find_elements(
+            driver,
+            [
+                "#custom-message",
+                "textarea[name='message']",
+                "textarea",
+                "[role='textbox']",
+                "[contenteditable='true']",
+                "[placeholder*='We know each other']",
+            ],
+        ):
+            if field.is_enabled() and fill_editable_element(driver, field, text):
+                return True
+        for node_id in cdp_find_nodes_by_attribute(driver, ["textarea"], "id", ["custom-message"]):
+            if cdp_set_node_value(driver, node_id, text):
+                return True
+        for node_id in cdp_find_nodes_by_attribute(driver, ["textarea"], "name", ["message"]):
+            if cdp_set_node_value(driver, node_id, text):
+                return True
+        for node_id in reversed(
+            cdp_find_editable_node_ids(
+                driver,
+                ["we know each other", "message", "custom-message", "200"],
+            )
+        ):
+            if cdp_set_node_value(driver, node_id, text):
+                return True
+        for backend_node_id in reversed(
+            ax_find_editable_backend_node_ids(
+                driver,
+                ["we know each other", "message", "note", "200"],
+            )
+        ):
+            if cdp_set_backend_node_text(driver, backend_node_id, text):
+                return True
+        if type_into_active_element(driver, text):
+            return True
+        if try_fill_dialog_textarea_by_focus(driver, text):
+            return True
+        if try_fill_dialog_textarea_by_center_click(driver, text):
+            return True
         time.sleep(0.5)
     return False
 
@@ -446,12 +1232,11 @@ def send_connection_request(driver: webdriver.Chrome, task: ProfileTask) -> bool
         save_debug_artifacts(driver, "connect_not_found")
         return False
 
-    if not wait_for_dialog(driver):
-        print("  Connect click did not open a dialog")
-        save_debug_artifacts(driver, "connect_dialog_not_found")
-        return False
-
     time.sleep(1)
+    dialog_detected = wait_for_dialog(driver)
+    if not dialog_detected:
+        print("  Connect dialog was not detected directly, attempting popup actions anyway")
+
     log_dialog_actions(driver)
     if task.note:
         print("  Connect dialog opened, trying Add a note")
@@ -461,7 +1246,15 @@ def send_connection_request(driver: webdriver.Chrome, task: ProfileTask) -> bool
             log_dialog_actions(driver)
             log_visible_buttons(driver)
             print("  Could not find Add a note in the connect dialog")
-            save_debug_artifacts(driver, "add_note_not_found")
+            if not dialog_detected:
+                save_debug_artifacts(driver, "connect_dialog_not_found")
+            else:
+                save_debug_artifacts(driver, "add_note_not_found")
+            return False
+        time.sleep(1)
+        if not wait_for_note_editor(driver):
+            print("  Add a note was clicked, but the note editor never became visible")
+            save_debug_artifacts(driver, "add_note_editor_not_found")
             return False
         filled = fill_dialog_textarea(driver, task.note)
         if not filled:
